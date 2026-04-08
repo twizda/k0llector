@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k0llector — collect a diagnostic bundle for k0rdent / management cluster troubleshooting.
+# k0llector — diagnostic bundle for k0rdent management clusters and/or k0s Kubernetes (see --k0s layer 11).
 # Requires: kubectl (and optional: ssh for layer 6, metrics-server for kubectl top).
 
 set -u
@@ -24,19 +24,34 @@ ARCHIVE_PATH_OVERRIDE="${K0LLECT_ARCHIVE_PATH:-}"
 [[ "${K0LLECT_ARCHIVE:-0}" == "1" ]] && CREATE_ARCHIVE=1
 # Unset K0LLECT_REQUEST_TIMEOUT → default 60s; empty K0LLECT_REQUEST_TIMEOUT → no --request-timeout (kubectl default).
 REQUEST_TIMEOUT="${K0LLECT_REQUEST_TIMEOUT-60s}"
+# --k0s enables layer 11 (k0s-focused API snapshots); combine with -l for standalone bundles (e.g. -l 1,6,10).
+K0S_EXTRAS="${K0LLECT_K0S_EXTRAS:-0}"
+# Comma-separated extra namespaces for layer 11 (+ layer 10 logs when present), e.g. "kube-node-lease,my-ns"
+K0S_EXTRA_NS="${K0LLECT_K0S_NS:-}"
+# Layer 6: run `k0s status` / `k0s etcd member-list` over SSH (controllers get etcd list). Disable with 0.
+SSH_K0S_CLI="${K0LLECT_SSH_K0S_CLI:-1}"
+K0S_BIN="${K0LLECT_K0S_BIN:-k0s}"
+# Redact kube-system ConfigMaps in layer 11 (see --redact-configmaps). Optional backup before redact.
+REDACT_CONFIGMAPS="${K0LLECT_REDACT_CONFIGMAPS:-0}"
+REDACT_KEEP_ORIGINAL="${K0LLECT_REDACT_KEEP_ORIGINAL:-0}"
 
 usage() {
   cat <<'EOF'
 Usage: collect.sh [options]
 
   -o DIR         Output root directory (default: ./k0llect-out or $K0LLECT_OUTPUT)
-  -l LIST        Comma-separated layers (default: 1–10). Example: -l 1,2,3
+  -l LIST        Comma-separated layers (default: 1–10; layer 11 appended when using --k0s). Example: -l 1,6,10,11
   --no-ssh       Skip layer 6 (node journalctl via SSH)
   --ssh-jump H   Bastion for layer 6: OpenSSH -J (e.g. user@bastion). Overrides $K0LLECT_SSH_JUMP.
   -a, --archive  Write a single .tar.gz of the run directory when finished
   --archive-path F  Full path for the tarball (default: <output-root>/<timestamp>.tar.gz)
   --request-timeout D  Per-request timeout for kubectl (e.g. 60s, 2m). Default from env or 60s.
   --no-request-timeout  Do not pass kubectl --request-timeout (use API server default).
+  --k0s          Enable layer 11: k0s-oriented cluster snapshots (API resources, kube-system,
+                 k0s-autopilot if present, nodes, webhooks, CSRs). Safe to combine with full k0rdent layers.
+  --redact-configmaps  After collecting layer 11 kube-system ConfigMaps, mask obvious secrets/tokens
+                 in that file (see K0LLECT_REDACT_*). Implies reviewing bundle before sharing.
+  --no-redact-configmaps  Do not redact (default unless K0LLECT_REDACT_CONFIGMAPS=1).
   --version      Print k0llector version and exit
   -h, --help     This help
 
@@ -46,12 +61,19 @@ Environment:
   K0LLECT_ARCHIVE=1, K0LLECT_ARCHIVE_PATH
   K0LLECT_LOG_TAIL (default 100), K0LLECT_LOGS_MAX_PODS (default 30, layer 10)
   K0LLECT_REQUEST_TIMEOUT (default 60s if unset; set to empty for no timeout)
+  K0LLECT_K0S_EXTRAS=1  Same as --k0s (append layer 11)
+  K0LLECT_K0S_NS  Comma-separated extra namespaces for layer 11 (+ layer 10 pod logs if ns exists)
+  K0LLECT_SSH_K0S_CLI=0  Disable layer 6 SSH: sudo k0s status / etcd member-list (default: 1 when SSH on)
+  K0LLECT_K0S_BIN  k0s binary name/path on remote nodes for SSH probes (default: k0s)
+  K0LLECT_REDACT_CONFIGMAPS=1  Redact layer 11 configmaps-kube-system.yaml (or use --redact-configmaps)
+  K0LLECT_REDACT_KEEP_ORIGINAL=1  Keep a .full copy before redacting ConfigMaps
 
 Multi-cluster: point kubectl at another cluster with KUBECONFIG or kubectl config use-context,
   and run collect.sh again with a different -o output root (or rename the timestamp dir).
 
 Layers: 1 mgmt health, 2 KCM, 3 k0rdent CRs+templates, 4 Flux, 5 HCP/k0smotron,
-        6 SSH journals, 7 Cluster API, 8 projectsveltos, 9 monitors/KOF, 10 namespace log samples.
+        6 SSH journals, 7 Cluster API, 8 projectsveltos, 9 monitors/KOF, 10 namespace log samples,
+        11 k0s cluster snapshots (enabled with --k0s or K0LLECT_K0S_EXTRAS=1).
 
 Layer 6: ssh … -J <jump> user@node when K0LLECT_SSH_JUMP / --ssh-jump set.
 EOF
@@ -68,11 +90,16 @@ while [[ $# -gt 0 ]]; do
     --archive-path) ARCHIVE_PATH_OVERRIDE="$2"; CREATE_ARCHIVE=1; shift 2 ;;
     --request-timeout) REQUEST_TIMEOUT="$2"; shift 2 ;;
     --no-request-timeout) REQUEST_TIMEOUT=""; shift ;;
+    --k0s) K0S_EXTRAS=1; shift ;;
+    --redact-configmaps) REDACT_CONFIGMAPS=1; shift ;;
+    --no-redact-configmaps) REDACT_CONFIGMAPS=0; shift ;;
     --version) echo "k0llector ${K0LLECTOR_VERSION}"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+[[ "${K0S_EXTRAS}" == "1" ]] && [[ ",${LAYERS}," != *",11,"*" ]] && LAYERS="${LAYERS},11"
 
 layer_enabled() {
   local n="$1"
@@ -92,6 +119,40 @@ coredns_selector_to_basename() {
   s="${s//,/-}"
   s="${s// /-}"
   printf '%s' "$s"
+}
+
+trim_space() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+ns_to_safe_basename() {
+  local s="$1"
+  s="${s//[^a-zA-Z0-9._-]/_}"
+  [[ -z "$s" ]] && s="ns"
+  printf '%s' "$s"
+}
+
+# Best-effort masking for layer 11 kube-system ConfigMaps (verify before external share).
+redact_configmap_yaml_file() {
+  local f="$1"
+  [[ ! -f "$f" ]] && return 0
+  local t
+  t="$(mktemp "${TMPDIR:-/tmp}/k0llect-redact.XXXXXX")"
+  if [[ "${REDACT_KEEP_ORIGINAL}" == "1" ]]; then
+    cp "$f" "${f}.full"
+  fi
+  sed -E \
+    -e 's/^([[:space:]]*(password|passwd|token|secretKey|client-certificate-data|certificate-authority-data|client-key-data|serviceAccountToken|\.dockercfg):)[[:space:]].*/\1 <REDACTED>/I' \
+    -e 's/^([[:space:]]*[a-zA-Z0-9._-]+:[[:space:]]+)([A-Za-z0-9+/]{80,}[=]*)$/\1<REDACTED_BASE64>/' \
+    "$f" >"$t"
+  {
+    echo "# k0llector: REDACT_CONFIGMAPS applied $(timestamp_utc) (best-effort; review before sharing)"
+    cat "$t"
+  } >"$f"
+  rm -f "$t"
 }
 
 # Run command; capture stdout+stderr to file; never abort the script.
@@ -171,6 +232,12 @@ fi
   echo "kubectl_request_timeout: ${REQUEST_TIMEOUT:-<none>}"
   echo "KUBECONFIG: ${KUBECONFIG:-<unset, default kubeconfig>}"
   echo "layers: $LAYERS"
+  echo "k0s_extras: $([[ "${K0S_EXTRAS}" == "1" ]] && echo true || echo false)"
+  echo "k0s_extra_namespaces: ${K0S_EXTRA_NS:-<none>}"
+  echo "ssh_k0s_cli: ${SSH_K0S_CLI}"
+  echo "k0s_bin_for_ssh: ${K0S_BIN}"
+  echo "redact_configmaps: ${REDACT_CONFIGMAPS}"
+  echo "redact_keep_original: ${REDACT_KEEP_ORIGINAL}"
   echo "kcm_namespace: $KCM_NS"
   echo "kof_namespace: ${KOF_NS:-<unset>}"
   echo "---"
@@ -292,6 +359,11 @@ if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
     echo "# jump (-J): ${SSH_JUMP:-<none>}"
     echo "# extra opts: $SSH_OPTS"
   } >"$L6/ssh-config-snippet.txt"
+  {
+    echo "# Optional: sudo ${K0S_BIN} status / etcd member-list on controllers when K0LLECT_SSH_K0S_CLI=1 (default)."
+    echo "# Disable: K0LLECT_SSH_K0S_CLI=0"
+    echo "# Remote binary: K0LLECT_K0S_BIN=${K0S_BIN}"
+  } >>"$L6/ssh-config-snippet.txt"
 
   # shellcheck disable=SC2046
   for node in $("${KUBECTL_CMD[@]}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
@@ -313,6 +385,14 @@ if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
       # shellcheck disable=SC2086
       collect "$target/journal-k0sworker.txt" ssh "${SSH_JUMP_ARGS[@]}" $SSH_OPTS "${SSH_USER}@${node}" sudo -n journalctl -u k0sworker --no-pager -n 200
     fi
+    if [[ "${SSH_K0S_CLI}" == "1" ]]; then
+      # shellcheck disable=SC2086
+      collect "$target/k0s-status.txt" ssh "${SSH_JUMP_ARGS[@]}" $SSH_OPTS "${SSH_USER}@${node}" sudo -n "$K0S_BIN" status
+      if [[ -n "$is_cp" ]]; then
+        # shellcheck disable=SC2086
+        collect "$target/k0s-etcd-member-list.txt" ssh "${SSH_JUMP_ARGS[@]}" $SSH_OPTS "${SSH_USER}@${node}" sudo -n "$K0S_BIN" etcd member-list
+      fi
+    fi
   done
 elif layer_enabled 6; then
   L6="$OUT/layer6-k0s-node"
@@ -322,6 +402,7 @@ elif layer_enabled 6; then
     echo "# Optional bastion: K0LLECT_SSH_JUMP=user@bastion or --ssh-jump user@bastion"
     echo "# To collect manually on each controller: sudo journalctl -u k0scontroller --no-pager -n 200"
     echo "# On each worker: sudo journalctl -u k0sworker --no-pager -n 200"
+    echo "# Optional: sudo ${K0S_BIN} status; on controllers: sudo ${K0S_BIN} etcd member-list"
   } >"$L6/SKIPPED.txt"
 fi
 
@@ -382,15 +463,91 @@ fi
 if layer_enabled 10; then
   L10="$OUT/layer10-namespace-logs"
   mkdir -p "$L10"
+  _l10_ns=( "$KCM_NS" projectsveltos kube-system kubevirt cdi )
+  if [[ -n "$K0S_EXTRA_NS" ]]; then
+    IFS=',' read -r -a _l10_extra <<< "$K0S_EXTRA_NS"
+    for _x in "${_l10_extra[@]}"; do
+      _x="$(trim_space "$_x")"
+      [[ -n "$_x" ]] && _l10_ns+=( "$_x" )
+    done
+  fi
+  _l10_readme_ns="$(printf '%s\n' "${_l10_ns[@]}" | awk 'NF && !seen[$0]++' | xargs | tr ' ' ',')"
   {
     echo "# Per-pod log tail=${LOG_TAIL}, max pods per namespace=${LOGS_MAX_PODS}"
-    echo "# Namespaces: kcm-system, projectsveltos, kube-system, kubevirt, cdi (when present)"
+    echo "# Namespaces (deduped, when present): ${_l10_readme_ns}"
   } >"$L10/README.txt"
-  for log_ns in "$KCM_NS" projectsveltos kube-system kubevirt cdi; do
+  while IFS= read -r log_ns; do
+    [[ -z "$log_ns" ]] && continue
     if namespace_exists "$log_ns"; then
       collect_namespace_pod_logs "$log_ns" "$L10/logs-${log_ns}"
     fi
-  done
+  done < <(printf '%s\n' "${_l10_ns[@]}" | awk 'NF && !seen[$0]++')
+fi
+
+# --- Layer 11: k0s-oriented snapshots (in-cluster; pair with layer 6 for host journals) ---
+if layer_enabled 11; then
+  L11="$OUT/layer11-k0s"
+  mkdir -p "$L11"
+  {
+    echo "# k0llector @ $(timestamp_utc)"
+    echo "# command: ${KUBECTL_CMD[*]} api-resources | grep -i k0s"
+    echo "---"
+    "${KUBECTL_CMD[@]}" api-resources 2>&1 | grep -i k0s || true
+    echo "---"
+  } >"$L11/api-resources-grep-k0s.txt"
+  collect "$L11/nodes.yaml" "${KUBECTL_CMD[@]}" get nodes -o yaml
+  {
+    echo "# k0llector @ $(timestamp_utc)"
+    echo "# optional: componentstatuses (removed in newer Kubernetes; non-zero exit is normal)"
+    echo "---"
+    "${KUBECTL_CMD[@]}" get componentstatuses 2>&1 || true
+    echo "---"
+  } >"$L11/componentstatus-optional.txt"
+  collect "$L11/events-kube-system.txt" "${KUBECTL_CMD[@]}" get events -n kube-system --sort-by='.lastTimestamp'
+  collect "$L11/pods-kube-system-wide.txt" "${KUBECTL_CMD[@]}" get pods -n kube-system -o wide
+  collect "$L11/configmaps-kube-system.yaml" "${KUBECTL_CMD[@]}" get configmap -n kube-system -o yaml
+  if [[ "${REDACT_CONFIGMAPS}" == "1" ]]; then
+    redact_configmap_yaml_file "$L11/configmaps-kube-system.yaml"
+  fi
+  collect "$L11/daemonsets-kube-system.txt" "${KUBECTL_CMD[@]}" get daemonsets -n kube-system -o wide
+  collect "$L11/deployments-kube-system.txt" "${KUBECTL_CMD[@]}" get deployments -n kube-system -o wide
+  collect "$L11/endpoints-kube-system.txt" "${KUBECTL_CMD[@]}" get endpoints -n kube-system -o wide
+  collect "$L11/validatingwebhookconfigurations.yaml" "${KUBECTL_CMD[@]}" get validatingwebhookconfiguration -o yaml
+  collect "$L11/mutatingwebhookconfigurations.yaml" "${KUBECTL_CMD[@]}" get mutatingwebhookconfiguration -o yaml
+  collect "$L11/csrs.yaml" "${KUBECTL_CMD[@]}" get csr -o yaml
+  collect "$L11/top-pods-kube-system.txt" "${KUBECTL_CMD[@]}" top pods -n kube-system
+  if namespace_exists k0s-autopilot; then
+    collect "$L11/k0s-autopilot-pods.txt" "${KUBECTL_CMD[@]}" get pods -n k0s-autopilot -o wide
+    collect "$L11/k0s-autopilot-events.txt" "${KUBECTL_CMD[@]}" get events -n k0s-autopilot --sort-by='.lastTimestamp'
+    collect "$L11/k0s-autopilot-resources.yaml" "${KUBECTL_CMD[@]}" get all -n k0s-autopilot -o yaml
+  else
+    echo "# namespace k0s-autopilot not present" >"$L11/k0s-autopilot-SKIPPED.txt"
+  fi
+  collect "$L11/helmrelease-kube-system.yaml" "${KUBECTL_CMD[@]}" get helmrelease -n kube-system -o yaml
+  {
+    echo "# k0llector @ $(timestamp_utc)"
+    echo "# non-Running / non-Succeeded lines in kube-system"
+    echo "---"
+    "${KUBECTL_CMD[@]}" get pods -n kube-system 2>&1 | awk 'NR==1 || ($3 !~ /Running/ && $3 !~ /Succeeded/ && $3 !~ /Completed/)' || true
+    echo "---"
+  } >"$L11/pods-kube-system-not-ready-lines.txt"
+  if [[ -n "$K0S_EXTRA_NS" ]]; then
+    IFS=',' read -r -a _k11_extra <<< "$K0S_EXTRA_NS"
+    for _xn in "${_k11_extra[@]}"; do
+      _xn="$(trim_space "$_xn")"
+      [[ -z "$_xn" ]] && continue
+      [[ "$_xn" == "k0s-autopilot" ]] && continue
+      [[ "$_xn" == "kube-system" ]] && continue
+      _xsb="$(ns_to_safe_basename "$_xn")"
+      if namespace_exists "$_xn"; then
+        collect "$L11/extra-ns-${_xsb}-pods.txt" "${KUBECTL_CMD[@]}" get pods -n "$_xn" -o wide
+        collect "$L11/extra-ns-${_xsb}-events.txt" "${KUBECTL_CMD[@]}" get events -n "$_xn" --sort-by='.lastTimestamp'
+        collect "$L11/extra-ns-${_xsb}-resources.yaml" "${KUBECTL_CMD[@]}" get all -n "$_xn" -o yaml
+      else
+        echo "# namespace not found: ${_xn}" >"$L11/extra-ns-${_xsb}-MISSING.txt"
+      fi
+    done
+  fi
 fi
 
 # Bundle summary (exit_code rollup for collect() outputs)
@@ -404,6 +561,10 @@ _summary_ctx="$("${KUBECTL_CMD[@]}" config current-context 2>/dev/null || echo '
   echo "kubectl_request_timeout: ${REQUEST_TIMEOUT:-<none>}"
   echo "KUBECONFIG: ${KUBECONFIG:-<unset, default kubeconfig>}"
   echo "layers: $LAYERS"
+  echo "k0s_extras: $([[ "${K0S_EXTRAS}" == "1" ]] && echo true || echo false)"
+  echo "k0s_extra_namespaces: ${K0S_EXTRA_NS:-<none>}"
+  echo "ssh_k0s_cli: ${SSH_K0S_CLI}"
+  echo "redact_configmaps: ${REDACT_CONFIGMAPS}"
   echo "bundle_disk_usage:"
   du -sh "$OUT" 2>/dev/null || true
   echo "---"
