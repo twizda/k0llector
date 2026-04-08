@@ -22,6 +22,8 @@ LOGS_MAX_PODS="${K0LLECT_LOGS_MAX_PODS:-30}"
 CREATE_ARCHIVE=0
 ARCHIVE_PATH_OVERRIDE="${K0LLECT_ARCHIVE_PATH:-}"
 [[ "${K0LLECT_ARCHIVE:-0}" == "1" ]] && CREATE_ARCHIVE=1
+# Unset K0LLECT_REQUEST_TIMEOUT → default 60s; empty K0LLECT_REQUEST_TIMEOUT → no --request-timeout (kubectl default).
+REQUEST_TIMEOUT="${K0LLECT_REQUEST_TIMEOUT-60s}"
 
 usage() {
   cat <<'EOF'
@@ -33,6 +35,8 @@ Usage: collect.sh [options]
   --ssh-jump H   Bastion for layer 6: OpenSSH -J (e.g. user@bastion). Overrides $K0LLECT_SSH_JUMP.
   -a, --archive  Write a single .tar.gz of the run directory when finished
   --archive-path F  Full path for the tarball (default: <output-root>/<timestamp>.tar.gz)
+  --request-timeout D  Per-request timeout for kubectl (e.g. 60s, 2m). Default from env or 60s.
+  --no-request-timeout  Do not pass kubectl --request-timeout (use API server default).
   --version      Print k0llector version and exit
   -h, --help     This help
 
@@ -41,6 +45,10 @@ Environment:
   K0LLECT_COREDNS_LABELS, K0LLECT_SSH_USER, K0LLECT_SSH_JUMP, K0LLECT_SSH_OPTS, K0LLECT_SKIP_SSH
   K0LLECT_ARCHIVE=1, K0LLECT_ARCHIVE_PATH
   K0LLECT_LOG_TAIL (default 100), K0LLECT_LOGS_MAX_PODS (default 30, layer 10)
+  K0LLECT_REQUEST_TIMEOUT (default 60s if unset; set to empty for no timeout)
+
+Multi-cluster: point kubectl at another cluster with KUBECONFIG or kubectl config use-context,
+  and run collect.sh again with a different -o output root (or rename the timestamp dir).
 
 Layers: 1 mgmt health, 2 KCM, 3 k0rdent CRs+templates, 4 Flux, 5 HCP/k0smotron,
         6 SSH journals, 7 Cluster API, 8 projectsveltos, 9 monitors/KOF, 10 namespace log samples.
@@ -58,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --ssh-jump) SSH_JUMP="$2"; shift 2 ;;
     -a|--archive) CREATE_ARCHIVE=1; shift ;;
     --archive-path) ARCHIVE_PATH_OVERRIDE="$2"; CREATE_ARCHIVE=1; shift 2 ;;
+    --request-timeout) REQUEST_TIMEOUT="$2"; shift 2 ;;
+    --no-request-timeout) REQUEST_TIMEOUT=""; shift ;;
     --version) echo "k0llector ${K0LLECTOR_VERSION}"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -72,7 +82,7 @@ layer_enabled() {
 timestamp_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 namespace_exists() {
-  "$KUBECTL" get ns "$1" -o name &>/dev/null
+  "${KUBECTL_CMD[@]}" get ns "$1" -o name &>/dev/null
 }
 
 coredns_selector_to_basename() {
@@ -133,11 +143,11 @@ collect_namespace_pod_logs() {
   local n=0
   mkdir -p "$out_dir"
   # shellcheck disable=SC2046
-  for pod in $("$KUBECTL" get pods -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+  for pod in $("${KUBECTL_CMD[@]}" get pods -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
     [[ -z "$pod" ]] && continue
     n=$((n + 1))
     [[ "$n" -gt "$LOGS_MAX_PODS" ]] && break
-    collect "$out_dir/${pod}.txt" "$KUBECTL" logs -n "$ns" "$pod" --all-containers=true --tail="$LOG_TAIL" --prefix=true
+    collect "$out_dir/${pod}.txt" "${KUBECTL_CMD[@]}" logs -n "$ns" "$pod" --all-containers=true --tail="$LOG_TAIL" --prefix=true
   done
 }
 
@@ -147,37 +157,45 @@ mkdir -p "$OUT"
 
 need_kubectl
 
+if [[ -n "$REQUEST_TIMEOUT" ]]; then
+  KUBECTL_CMD=( "$KUBECTL" --request-timeout="$REQUEST_TIMEOUT" )
+else
+  KUBECTL_CMD=( "$KUBECTL" )
+fi
+
 {
   echo "k0llector_version: ${K0LLECTOR_VERSION}"
   echo "k0llector_run_utc: $(timestamp_utc)"
   echo "output_dir: $OUT"
   echo "kubectl: $KUBECTL"
+  echo "kubectl_request_timeout: ${REQUEST_TIMEOUT:-<none>}"
+  echo "KUBECONFIG: ${KUBECONFIG:-<unset, default kubeconfig>}"
   echo "layers: $LAYERS"
   echo "kcm_namespace: $KCM_NS"
   echo "kof_namespace: ${KOF_NS:-<unset>}"
   echo "---"
-  "$KUBECTL" version -o yaml 2>&1 || true
+  "${KUBECTL_CMD[@]}" version -o yaml 2>&1 || true
   echo "---"
-  "$KUBECTL" config current-context 2>&1 || true
+  "${KUBECTL_CMD[@]}" config current-context 2>&1 || true
 } >"$OUT/00-meta.txt" 2>&1
 
-collect "$OUT/00-cluster-info.txt" "$KUBECTL" cluster-info
+collect "$OUT/00-cluster-info.txt" "${KUBECTL_CMD[@]}" cluster-info
 
 # --- Layer 1 ---
 if layer_enabled 1; then
   L1="$OUT/layer1-management-cluster"
   mkdir -p "$L1"
-  collect "$L1/nodes-wide.txt" "$KUBECTL" get nodes -o wide
-  collect "$L1/top-nodes.txt" "$KUBECTL" top nodes
-  collect "$L1/pods-kube-system.txt" "$KUBECTL" get pods -n kube-system -o wide
-  collect "$L1/api-resources-k0rdent.txt" "$KUBECTL" api-resources --api-group=k0rdent.mirantis.com -o wide
+  collect "$L1/nodes-wide.txt" "${KUBECTL_CMD[@]}" get nodes -o wide
+  collect "$L1/top-nodes.txt" "${KUBECTL_CMD[@]}" top nodes
+  collect "$L1/pods-kube-system.txt" "${KUBECTL_CMD[@]}" get pods -n kube-system -o wide
+  collect "$L1/api-resources-k0rdent.txt" "${KUBECTL_CMD[@]}" api-resources --api-group=k0rdent.mirantis.com -o wide
   IFS=',' read -r -a _coredns_sels <<< "$COREDNS_LABELS"
   for sel in "${_coredns_sels[@]}"; do
     sel="$(printf '%s\n' "$sel" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$sel" ]] && continue
     _bn="$(coredns_selector_to_basename "$sel")"
-    collect "$L1/describe-coredns-${_bn}.txt" "$KUBECTL" describe pods -n kube-system -l "$sel"
-    collect "$L1/logs-coredns-${_bn}.txt" "$KUBECTL" logs -n kube-system -l "$sel" --tail=100 --prefix=true
+    collect "$L1/describe-coredns-${_bn}.txt" "${KUBECTL_CMD[@]}" describe pods -n kube-system -l "$sel"
+    collect "$L1/logs-coredns-${_bn}.txt" "${KUBECTL_CMD[@]}" logs -n kube-system -l "$sel" --tail=100 --prefix=true
   done
 fi
 
@@ -185,84 +203,84 @@ fi
 if layer_enabled 2; then
   L2="$OUT/layer2-kcm"
   mkdir -p "$L2"
-  collect "$L2/management.yaml" "$KUBECTL" get management -o yaml
-  collect "$L2/pods-wide.txt" "$KUBECTL" get pods -n "$KCM_NS" -o wide
-  collect "$L2/describe-pods.txt" "$KUBECTL" describe pods -n "$KCM_NS"
-  collect "$L2/logs-kcm-controller-manager.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=kcm-controller-manager --tail=200 --prefix=true
-  collect "$L2/events-kcm-system.txt" "$KUBECTL" get events -n "$KCM_NS" --sort-by='.lastTimestamp'
-  collect "$L2/events-kcm-controller-all-ns.txt" "$KUBECTL" get events -A --field-selector reportingComponent=kcm-controller-manager
-  collect "$L2/validatingwebhookconfigurations.yaml" "$KUBECTL" get validatingwebhookconfiguration -o yaml
-  collect "$L2/mutatingwebhookconfigurations.yaml" "$KUBECTL" get mutatingwebhookconfiguration -o yaml
+  collect "$L2/management.yaml" "${KUBECTL_CMD[@]}" get management -o yaml
+  collect "$L2/pods-wide.txt" "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" -o wide
+  collect "$L2/describe-pods.txt" "${KUBECTL_CMD[@]}" describe pods -n "$KCM_NS"
+  collect "$L2/logs-kcm-controller-manager.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=kcm-controller-manager --tail=200 --prefix=true
+  collect "$L2/events-kcm-system.txt" "${KUBECTL_CMD[@]}" get events -n "$KCM_NS" --sort-by='.lastTimestamp'
+  collect "$L2/events-kcm-controller-all-ns.txt" "${KUBECTL_CMD[@]}" get events -A --field-selector reportingComponent=kcm-controller-manager
+  collect "$L2/validatingwebhookconfigurations.yaml" "${KUBECTL_CMD[@]}" get validatingwebhookconfiguration -o yaml
+  collect "$L2/mutatingwebhookconfigurations.yaml" "${KUBECTL_CMD[@]}" get mutatingwebhookconfiguration -o yaml
 fi
 
 # --- Layer 3 ---
 if layer_enabled 3; then
   L3="$OUT/layer3-kcm-resources"
   mkdir -p "$L3"
-  collect "$L3/clustertemplate.yaml" "$KUBECTL" get clustertemplate -n "$KCM_NS" -o yaml
-  collect "$L3/servicetemplate.yaml" "$KUBECTL" get servicetemplate -n "$KCM_NS" -o yaml
-  collect "$L3/clusterdeployment-all.yaml" "$KUBECTL" get clusterdeployment -A -o yaml
-  collect "$L3/providertemplate.yaml" "$KUBECTL" get providertemplate -n "$KCM_NS" -o yaml
-  collect_with_preamble "$L3/credentials.yaml" "# NOTICE: Credential objects may reference Secret names; review before sharing." "$KUBECTL" get credentials -n "$KCM_NS" -o yaml
-  collect "$L3/releases.yaml" "$KUBECTL" get release -o yaml
-  collect "$L3/accessmanagements.yaml" "$KUBECTL" get accessmanagement -o yaml
-  collect "$L3/multiclusterservices.yaml" "$KUBECTL" get multiclusterservice -o yaml
-  collect "$L3/managementbackups.yaml" "$KUBECTL" get managementbackup -o yaml
-  collect "$L3/providerinterfaces.yaml" "$KUBECTL" get providerinterface -o yaml
-  collect "$L3/regions.yaml" "$KUBECTL" get region -o yaml
-  collect "$L3/statemanagementproviders.yaml" "$KUBECTL" get statemanagementprovider -o yaml
-  collect "$L3/clustertemplatechains.yaml" "$KUBECTL" get clustertemplatechain -n "$KCM_NS" -o yaml
-  collect "$L3/servicetemplatechains.yaml" "$KUBECTL" get servicetemplatechain -n "$KCM_NS" -o yaml
-  collect "$L3/servicesets.yaml" "$KUBECTL" get serviceset -n "$KCM_NS" -o yaml
-  collect "$L3/clusterauthentications.yaml" "$KUBECTL" get clusterauthentication -n "$KCM_NS" -o yaml
-  collect "$L3/datasources.yaml" "$KUBECTL" get datasource -n "$KCM_NS" -o yaml
-  collect "$L3/clusterdatasources.yaml" "$KUBECTL" get clusterdatasource -n "$KCM_NS" -o yaml
-  collect "$L3/clusteripams.yaml" "$KUBECTL" get clusteripam -n "$KCM_NS" -o yaml
-  collect "$L3/clusteripamclaims.yaml" "$KUBECTL" get clusteripamclaim -n "$KCM_NS" -o yaml
+  collect "$L3/clustertemplate.yaml" "${KUBECTL_CMD[@]}" get clustertemplate -n "$KCM_NS" -o yaml
+  collect "$L3/servicetemplate.yaml" "${KUBECTL_CMD[@]}" get servicetemplate -n "$KCM_NS" -o yaml
+  collect "$L3/clusterdeployment-all.yaml" "${KUBECTL_CMD[@]}" get clusterdeployment -A -o yaml
+  collect "$L3/providertemplate.yaml" "${KUBECTL_CMD[@]}" get providertemplate -n "$KCM_NS" -o yaml
+  collect_with_preamble "$L3/credentials.yaml" "# NOTICE: Credential objects may reference Secret names; review before sharing." "${KUBECTL_CMD[@]}" get credentials -n "$KCM_NS" -o yaml
+  collect "$L3/releases.yaml" "${KUBECTL_CMD[@]}" get release -o yaml
+  collect "$L3/accessmanagements.yaml" "${KUBECTL_CMD[@]}" get accessmanagement -o yaml
+  collect "$L3/multiclusterservices.yaml" "${KUBECTL_CMD[@]}" get multiclusterservice -o yaml
+  collect "$L3/managementbackups.yaml" "${KUBECTL_CMD[@]}" get managementbackup -o yaml
+  collect "$L3/providerinterfaces.yaml" "${KUBECTL_CMD[@]}" get providerinterface -o yaml
+  collect "$L3/regions.yaml" "${KUBECTL_CMD[@]}" get region -o yaml
+  collect "$L3/statemanagementproviders.yaml" "${KUBECTL_CMD[@]}" get statemanagementprovider -o yaml
+  collect "$L3/clustertemplatechains.yaml" "${KUBECTL_CMD[@]}" get clustertemplatechain -n "$KCM_NS" -o yaml
+  collect "$L3/servicetemplatechains.yaml" "${KUBECTL_CMD[@]}" get servicetemplatechain -n "$KCM_NS" -o yaml
+  collect "$L3/servicesets.yaml" "${KUBECTL_CMD[@]}" get serviceset -n "$KCM_NS" -o yaml
+  collect "$L3/clusterauthentications.yaml" "${KUBECTL_CMD[@]}" get clusterauthentication -n "$KCM_NS" -o yaml
+  collect "$L3/datasources.yaml" "${KUBECTL_CMD[@]}" get datasource -n "$KCM_NS" -o yaml
+  collect "$L3/clusterdatasources.yaml" "${KUBECTL_CMD[@]}" get clusterdatasource -n "$KCM_NS" -o yaml
+  collect "$L3/clusteripams.yaml" "${KUBECTL_CMD[@]}" get clusteripam -n "$KCM_NS" -o yaml
+  collect "$L3/clusteripamclaims.yaml" "${KUBECTL_CMD[@]}" get clusteripamclaim -n "$KCM_NS" -o yaml
 fi
 
 # --- Layer 4 ---
 if layer_enabled 4; then
   L4="$OUT/layer4-flux"
   mkdir -p "$L4"
-  collect "$L4/helmrelease-all.yaml" "$KUBECTL" get helmrelease -A -o yaml
-  collect "$L4/helmrepository-all.yaml" "$KUBECTL" get helmrepository -A -o yaml
-  collect "$L4/helmchart-all.txt" "$KUBECTL" get helmchart -A
-  collect "$L4/gitrepository-all.yaml" "$KUBECTL" get gitrepository -A -o yaml
-  collect "$L4/ocirepository-all.yaml" "$KUBECTL" get ocirepository -A -o yaml
-  collect "$L4/bucket-all.yaml" "$KUBECTL" get bucket -A -o yaml
-  collect "$L4/kustomization-all.yaml" "$KUBECTL" get kustomization -A -o yaml
-  collect "$L4/logs-helm-controller.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=helm-controller --tail=200 --prefix=true
-  collect "$L4/logs-source-controller.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=source-controller --tail=200 --prefix=true
-  collect "$L4/logs-kustomize-controller.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=kustomize-controller --tail=200 --prefix=true
-  collect "$L4/logs-notification-controller.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=notification-controller --tail=200 --prefix=true
-  collect "$L4/logs-image-automation-controller.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=image-automation-controller --tail=200 --prefix=true
-  collect "$L4/logs-image-reflector-controller.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=image-reflector-controller --tail=200 --prefix=true
+  collect "$L4/helmrelease-all.yaml" "${KUBECTL_CMD[@]}" get helmrelease -A -o yaml
+  collect "$L4/helmrepository-all.yaml" "${KUBECTL_CMD[@]}" get helmrepository -A -o yaml
+  collect "$L4/helmchart-all.txt" "${KUBECTL_CMD[@]}" get helmchart -A
+  collect "$L4/gitrepository-all.yaml" "${KUBECTL_CMD[@]}" get gitrepository -A -o yaml
+  collect "$L4/ocirepository-all.yaml" "${KUBECTL_CMD[@]}" get ocirepository -A -o yaml
+  collect "$L4/bucket-all.yaml" "${KUBECTL_CMD[@]}" get bucket -A -o yaml
+  collect "$L4/kustomization-all.yaml" "${KUBECTL_CMD[@]}" get kustomization -A -o yaml
+  collect "$L4/logs-helm-controller.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=helm-controller --tail=200 --prefix=true
+  collect "$L4/logs-source-controller.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=source-controller --tail=200 --prefix=true
+  collect "$L4/logs-kustomize-controller.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=kustomize-controller --tail=200 --prefix=true
+  collect "$L4/logs-notification-controller.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=notification-controller --tail=200 --prefix=true
+  collect "$L4/logs-image-automation-controller.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=image-automation-controller --tail=200 --prefix=true
+  collect "$L4/logs-image-reflector-controller.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=image-reflector-controller --tail=200 --prefix=true
 fi
 
 # --- Layer 5 ---
 if layer_enabled 5; then
   L5="$OUT/layer5-hcp-k0smotron"
   mkdir -p "$L5"
-  collect "$L5/pods-kcm-all.txt" "$KUBECTL" get pods -n "$KCM_NS" -o wide
+  collect "$L5/pods-kcm-all.txt" "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" -o wide
   {
     echo "# k0llector @ $(timestamp_utc)"
     echo "# non-Running lines (grep -v Running on kubectl get pods)"
     echo "---"
-    "$KUBECTL" get pods -n "$KCM_NS" 2>&1 | grep -v Running || true
+    "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" 2>&1 | grep -v Running || true
     echo "---"
   } >"$L5/pods-not-running-lines.txt"
-  collect "$L5/pods-part-of-k0smotron.txt" "$KUBECTL" get pods -n "$KCM_NS" -l app.kubernetes.io/part-of=k0smotron -o wide
-  collect "$L5/logs-k0smotron-app-label.txt" "$KUBECTL" logs -n "$KCM_NS" -l app=k0smotron --tail=200 --prefix=true
-  collect "$L5/logs-k0smotron-part-of-label.txt" "$KUBECTL" logs -n "$KCM_NS" -l app.kubernetes.io/part-of=k0smotron --tail=200 --prefix=true
-  collect "$L5/statefulsets.txt" "$KUBECTL" get statefulsets -n "$KCM_NS" -o wide
+  collect "$L5/pods-part-of-k0smotron.txt" "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" -l app.kubernetes.io/part-of=k0smotron -o wide
+  collect "$L5/logs-k0smotron-app-label.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app=k0smotron --tail=200 --prefix=true
+  collect "$L5/logs-k0smotron-part-of-label.txt" "${KUBECTL_CMD[@]}" logs -n "$KCM_NS" -l app.kubernetes.io/part-of=k0smotron --tail=200 --prefix=true
+  collect "$L5/statefulsets.txt" "${KUBECTL_CMD[@]}" get statefulsets -n "$KCM_NS" -o wide
 fi
 
 # --- Layer 6 (optional SSH) ---
 if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
   L6="$OUT/layer6-k0s-node"
   mkdir -p "$L6"
-  collect "$L6/nodes-for-ssh.txt" "$KUBECTL" get nodes -o wide
+  collect "$L6/nodes-for-ssh.txt" "${KUBECTL_CMD[@]}" get nodes -o wide
 
   SSH_JUMP_ARGS=()
   if [[ -n "$SSH_JUMP" ]]; then
@@ -276,14 +294,14 @@ if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
   } >"$L6/ssh-config-snippet.txt"
 
   # shellcheck disable=SC2046
-  for node in $("$KUBECTL" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+  for node in $("${KUBECTL_CMD[@]}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
     [[ -z "$node" ]] && continue
-    cp_label="$("$KUBECTL" get node "$node" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/control-plane}' 2>/dev/null || true)"
-    role_label="$("$KUBECTL" get node "$node" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || true)"
+    cp_label="$("${KUBECTL_CMD[@]}" get node "$node" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/control-plane}' 2>/dev/null || true)"
+    role_label="$("${KUBECTL_CMD[@]}" get node "$node" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || true)"
     is_cp=""
     [[ "$cp_label" == "true" ]] && is_cp=1
     [[ "$role_label" == "true" ]] && is_cp=1
-    m_label="$("$KUBECTL" get node "$node" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}' 2>/dev/null || true)"
+    m_label="$("${KUBECTL_CMD[@]}" get node "$node" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}' 2>/dev/null || true)"
     [[ "$m_label" == "true" ]] && is_cp=1
 
     target="$L6/${node}"
@@ -311,15 +329,15 @@ fi
 if layer_enabled 7; then
   L7="$OUT/layer7-cluster-api"
   mkdir -p "$L7"
-  collect "$L7/clusters.yaml" "$KUBECTL" get cluster -A -o yaml
-  collect "$L7/machines.yaml" "$KUBECTL" get machine -A -o yaml
-  collect "$L7/machinedeployments.yaml" "$KUBECTL" get machinedeployment -A -o yaml
-  collect "$L7/machinesets.yaml" "$KUBECTL" get machineset -A -o yaml
-  collect "$L7/kubeadmcontrolplanes.yaml" "$KUBECTL" get kubeadmcontrolplane -A -o yaml
+  collect "$L7/clusters.yaml" "${KUBECTL_CMD[@]}" get cluster -A -o yaml
+  collect "$L7/machines.yaml" "${KUBECTL_CMD[@]}" get machine -A -o yaml
+  collect "$L7/machinedeployments.yaml" "${KUBECTL_CMD[@]}" get machinedeployment -A -o yaml
+  collect "$L7/machinesets.yaml" "${KUBECTL_CMD[@]}" get machineset -A -o yaml
+  collect "$L7/kubeadmcontrolplanes.yaml" "${KUBECTL_CMD[@]}" get kubeadmcontrolplane -A -o yaml
   for capi_ns in capi-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-docker-system capz-system capa-system capv-system capg-system capo-system; do
     if namespace_exists "$capi_ns"; then
-      collect "$L7/pods-${capi_ns}.txt" "$KUBECTL" get pods -n "$capi_ns" -o wide
-      collect "$L7/events-${capi_ns}.txt" "$KUBECTL" get events -n "$capi_ns" --sort-by='.lastTimestamp'
+      collect "$L7/pods-${capi_ns}.txt" "${KUBECTL_CMD[@]}" get pods -n "$capi_ns" -o wide
+      collect "$L7/events-${capi_ns}.txt" "${KUBECTL_CMD[@]}" get events -n "$capi_ns" --sort-by='.lastTimestamp'
     fi
   done
 fi
@@ -330,15 +348,15 @@ if layer_enabled 8; then
   mkdir -p "$L8"
   {
     echo "# k0llector @ $(timestamp_utc)"
-    echo "# command: $KUBECTL api-resources | grep -i sveltos"
+    echo "# command: ${KUBECTL_CMD[*]} api-resources | grep -i sveltos"
     echo "---"
-    "$KUBECTL" api-resources 2>&1 | grep -i sveltos || true
+    "${KUBECTL_CMD[@]}" api-resources 2>&1 | grep -i sveltos || true
     echo "---"
   } >"$L8/api-resources-sveltos.txt"
-  collect "$L8/sveltosclusters.yaml" "$KUBECTL" get sveltosclusters -A -o yaml
+  collect "$L8/sveltosclusters.yaml" "${KUBECTL_CMD[@]}" get sveltosclusters -A -o yaml
   if namespace_exists projectsveltos; then
-    collect "$L8/pods-projectsveltos.txt" "$KUBECTL" get pods -n projectsveltos -o wide
-    collect "$L8/events-projectsveltos.txt" "$KUBECTL" get events -n projectsveltos --sort-by='.lastTimestamp'
+    collect "$L8/pods-projectsveltos.txt" "${KUBECTL_CMD[@]}" get pods -n projectsveltos -o wide
+    collect "$L8/events-projectsveltos.txt" "${KUBECTL_CMD[@]}" get events -n projectsveltos --sort-by='.lastTimestamp'
   fi
 fi
 
@@ -346,13 +364,13 @@ fi
 if layer_enabled 9; then
   L9="$OUT/layer9-observability"
   mkdir -p "$L9"
-  collect "$L9/servicemonitors-kcm.yaml" "$KUBECTL" get servicemonitor -n "$KCM_NS" -o yaml
-  collect "$L9/podmonitors-kcm.yaml" "$KUBECTL" get podmonitor -n "$KCM_NS" -o yaml
-  collect "$L9/prometheusrules-kcm.yaml" "$KUBECTL" get prometheusrule -n "$KCM_NS" -o yaml
+  collect "$L9/servicemonitors-kcm.yaml" "${KUBECTL_CMD[@]}" get servicemonitor -n "$KCM_NS" -o yaml
+  collect "$L9/podmonitors-kcm.yaml" "${KUBECTL_CMD[@]}" get podmonitor -n "$KCM_NS" -o yaml
+  collect "$L9/prometheusrules-kcm.yaml" "${KUBECTL_CMD[@]}" get prometheusrule -n "$KCM_NS" -o yaml
   if [[ -n "$KOF_NS" ]] && namespace_exists "$KOF_NS"; then
-    collect "$L9/servicemonitors-kof-ns.yaml" "$KUBECTL" get servicemonitor -n "$KOF_NS" -o yaml
-    collect "$L9/podmonitors-kof-ns.yaml" "$KUBECTL" get podmonitor -n "$KOF_NS" -o yaml
-    collect "$L9/pods-kof-ns.txt" "$KUBECTL" get pods -n "$KOF_NS" -o wide
+    collect "$L9/servicemonitors-kof-ns.yaml" "${KUBECTL_CMD[@]}" get servicemonitor -n "$KOF_NS" -o yaml
+    collect "$L9/podmonitors-kof-ns.yaml" "${KUBECTL_CMD[@]}" get podmonitor -n "$KOF_NS" -o yaml
+    collect "$L9/pods-kof-ns.txt" "${KUBECTL_CMD[@]}" get pods -n "$KOF_NS" -o wide
   else
     {
       echo "# KOF namespace not set or missing. Set K0LLECT_KOF_NS to collect KOF ServiceMonitors/Pods (e.g. kof)."
@@ -375,6 +393,45 @@ if layer_enabled 10; then
   done
 fi
 
+# Bundle summary (exit_code rollup for collect() outputs)
+_summary_ctx="$("${KUBECTL_CMD[@]}" config current-context 2>/dev/null || echo '?')"
+{
+  echo "k0llector bundle summary"
+  echo "version: ${K0LLECTOR_VERSION}"
+  echo "generated_utc: $(timestamp_utc)"
+  echo "output_dir: $OUT"
+  echo "kubectl_context: ${_summary_ctx}"
+  echo "kubectl_request_timeout: ${REQUEST_TIMEOUT:-<none>}"
+  echo "KUBECONFIG: ${KUBECONFIG:-<unset, default kubeconfig>}"
+  echo "layers: $LAYERS"
+  echo "bundle_disk_usage:"
+  du -sh "$OUT" 2>/dev/null || true
+  echo "---"
+  echo "Files with non-zero # exit_code (from collect/kubectl steps):"
+  _nz=0
+  _total_f=0
+  while IFS= read -r _f; do
+    [[ -f "$_f" ]] || continue
+    grep -q '^# exit_code: ' "$_f" 2>/dev/null || continue
+    _total_f=$((_total_f + 1))
+    _ec="$(grep '^# exit_code: ' "$_f" 2>/dev/null | tail -1)"
+    _ec="${_ec##*exit_code: }"
+    _ec="${_ec// /}"
+    _ec="${_ec//$'\r'/}"
+    [[ -z "$_ec" ]] && continue
+    if [[ "$_ec" != "0" ]]; then
+      _nz=$((_nz + 1))
+      echo "  exit=${_ec}  ${_f#"${OUT}/"}"
+    fi
+  done < <(find "$OUT" -type f | sort)
+  if [[ "$_nz" -eq 0 ]]; then
+    echo "  (none)"
+  fi
+  echo "---"
+  echo "files_with_exit_code_footer: ${_total_f}"
+  echo "non_zero_exit_count: ${_nz}"
+} >"$OUT/00-SUMMARY.txt"
+
 # Bundle index (file list)
 {
   echo "# k0llector bundle file index @ $(timestamp_utc)"
@@ -385,6 +442,7 @@ fi
 } >"$OUT/00-INDEX.txt"
 
 echo "k0llector: wrote bundle under: $OUT"
+echo "k0llector: summary: $OUT/00-SUMMARY.txt"
 
 if [[ "$CREATE_ARCHIVE" == "1" ]]; then
   ARCHIVE_FILE="${ARCHIVE_PATH_OVERRIDE:-${OUTPUT_ROOT%/}/${RUN_TS}.tar.gz}"

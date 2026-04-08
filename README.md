@@ -1,8 +1,8 @@
 # k0llector
 
-**Version:** 0.1.1 (see `VERSION`; run `./collect.sh --version`)
+**Version:** 0.1.2 (see `VERSION`; run `./collect.sh --version`)
 
-Collects a timestamped diagnostic bundle from a k0rdent **management** cluster: kubectl-based inventory (layers 1–5, 7–10) and optional SSH for k0s journals on nodes (layer 6). Each run writes `00-INDEX.txt` listing all files and approximate bundle size.
+Collects a timestamped diagnostic bundle from a k0rdent **management** cluster: kubectl-based inventory (layers 1–5, 7–10) and optional SSH for k0s journals on nodes (layer 6). Each run writes **`00-SUMMARY.txt`** (rollup of non-zero `kubectl` exits and bundle size) and **`00-INDEX.txt`** (full file list).
 
 ## Usage
 
@@ -29,6 +29,8 @@ Default layers are **1–10**. Omit heavy sections with `-l` (e.g. `-l 1,2,3,4,5
 | `--ssh-jump H` | Bastion for layer 6 (`ssh -J`). Same as `K0LLECT_SSH_JUMP`. |
 | `-a`, `--archive` | Create one `.tar.gz` of the run directory |
 | `--archive-path F` | Full path for the tarball (implies `--archive`) |
+| `--request-timeout D` | Per-request timeout for every `kubectl` call (e.g. `60s`, `2m`). Overrides env default. |
+| `--no-request-timeout` | Do not pass `kubectl --request-timeout` (API server default). |
 
 ### Environment
 
@@ -42,8 +44,18 @@ Default layers are **1–10**. Omit heavy sections with `-l` (e.g. `-l 1,2,3,4,5
 | `K0LLECT_ARCHIVE`, `K0LLECT_ARCHIVE_PATH` | Archiving |
 | `K0LLECT_LOG_TAIL` | Tail lines per pod in layer 10 (default `100`) |
 | `K0LLECT_LOGS_MAX_PODS` | Max pods per namespace in layer 10 (default `30`) |
+| `K0LLECT_REQUEST_TIMEOUT` | If **unset**, k0llector defaults to `60s` for `kubectl --request-timeout`. If set to **empty**, no timeout flag is passed. Any other value is used as-is (e.g. `120s`). |
 
 Layer 6 uses `sudo -n journalctl` on the remote host (passwordless sudo required for non-interactive runs).
+
+### Multi-cluster / multiple kubeconfigs
+
+k0llector uses whatever cluster **`kubectl`** points at (`KUBECONFIG`, `kubectl config use-context`, etc.). To collect **another** cluster (e.g. regional or workload), run the script again with a different kube context or `KUBECONFIG` and a **separate** `-o` output root so bundles do not overwrite each other:
+
+```bash
+kubectl config use-context mgmt && ./collect.sh -o ./bundles/mgmt-run
+KUBECONFIG=~/.kube/regional.yaml ./collect.sh -o ./bundles/regional-run
+```
 
 ### CoreDNS labels (layer 1)
 
@@ -84,6 +96,7 @@ If a CRD or namespace is missing, the corresponding file contains the kubectl er
 
 ## Output files
 
-- `00-meta.txt` — k0llector version, kubectl version, context  
+- `00-meta.txt` — k0llector version, kubectl version, context, request timeout, `KUBECONFIG` hint  
 - `00-cluster-info.txt` — `kubectl cluster-info`  
+- `00-SUMMARY.txt` — bundle size, layers, list of files whose collected command ended with **non-zero** `# exit_code`, plus counts of files with an exit footer vs failures  
 - `00-INDEX.txt` — sorted file list and `du -sh` of the bundle  
