@@ -1,1 +1,13 @@
+# k0llector output bundles
 k0llect-out/
+
+# Claude Code working directory
+.claude/
+
+# macOS metadata
+.DS_Store
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~

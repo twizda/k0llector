@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # k0llector — diagnostic bundle for k0rdent management clusters and/or k0s Kubernetes (see --k0s layer 11).
 # Requires: kubectl (and optional: ssh for layer 6, metrics-server for kubectl top).
+# Requires bash (not POSIX sh).
 
-set -u
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K0LLECTOR_VERSION="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "${SCRIPT_DIR}/VERSION" 2>/dev/null || true)"
@@ -34,6 +35,8 @@ K0S_BIN="${K0LLECT_K0S_BIN:-k0s}"
 # Redact kube-system ConfigMaps in layer 11 (see --redact-configmaps). Optional backup before redact.
 REDACT_CONFIGMAPS="${K0LLECT_REDACT_CONFIGMAPS:-0}"
 REDACT_KEEP_ORIGINAL="${K0LLECT_REDACT_KEEP_ORIGINAL:-0}"
+# Comma-separated extra CAPI provider namespaces for layer 7 (in addition to the built-in list).
+CAPI_EXTRA_NS="${K0LLECT_CAPI_EXTRA_NS:-}"
 
 usage() {
   cat <<'EOF'
@@ -44,7 +47,7 @@ Usage: collect.sh [options]
   --no-ssh       Skip layer 6 (node journalctl via SSH)
   --ssh-jump H   Bastion for layer 6: OpenSSH -J (e.g. user@bastion). Overrides $K0LLECT_SSH_JUMP.
   -a, --archive  Write a single .tar.gz of the run directory when finished
-  --archive-path F  Full path for the tarball (default: <output-root>/<timestamp>.tar.gz)
+  --archive-path F  Full path for the tarball (default: <output-root>/<context>-<timestamp>.tar.gz)
   --request-timeout D  Per-request timeout for kubectl (e.g. 60s, 2m). Default from env or 60s.
   --no-request-timeout  Do not pass kubectl --request-timeout (use API server default).
   --k0s          Enable layer 11: k0s-oriented cluster snapshots (API resources, kube-system,
@@ -67,9 +70,16 @@ Environment:
   K0LLECT_K0S_BIN  k0s binary name/path on remote nodes for SSH probes (default: k0s)
   K0LLECT_REDACT_CONFIGMAPS=1  Redact layer 11 configmaps-kube-system.yaml (or use --redact-configmaps)
   K0LLECT_REDACT_KEEP_ORIGINAL=1  Keep a .full copy before redacting ConfigMaps
+  K0LLECT_CAPI_EXTRA_NS  Comma-separated extra CAPI provider namespaces for layer 7
 
-Multi-cluster: point kubectl at another cluster with KUBECONFIG or kubectl config use-context,
-  and run collect.sh again with a different -o output root (or rename the timestamp dir).
+Multi-cluster: set KUBECONFIG to the desired kubeconfig file and run collect.sh again with -o to write
+  to a separate output root (e.g. KUBECONFIG=~/clusters/prod.yaml ./collect.sh -o ./prod-bundle).
+
+Layer 6 SSH prerequisites:
+  - SSH key authentication (no password prompt) from the host running collect.sh to each node
+  - Passwordless sudo (sudo -n) configured on each node for the SSH user
+  - Set K0LLECT_SSH_USER=<user> (e.g. K0LLECT_SSH_USER=ubuntu ./collect.sh)
+  - Optionally: K0LLECT_SSH_JUMP=user@bastion for nodes not directly reachable
 
 Layers: 1 mgmt health, 2 KCM, 3 k0rdent CRs+templates, 4 Flux, 5 HCP/k0smotron,
         6 SSH journals, 7 Cluster API, 8 projectsveltos, 9 monitors/KOF, 10 namespace log samples,
@@ -99,7 +109,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "${K0S_EXTRAS}" == "1" ]] && [[ ",${LAYERS}," != *",11,"*" ]] && LAYERS="${LAYERS},11"
+[[ "${K0S_EXTRAS}" == "1" ]] && [[ ",${LAYERS}," != *",11,"* ]] && LAYERS="${LAYERS},11"
+
+# Validate layer numbers.
+while IFS= read -r _l; do
+  _l="${_l// /}"
+  [[ -z "$_l" ]] && continue
+  if ! [[ "$_l" =~ ^[0-9]+$ ]] || [[ "$_l" -lt 1 ]] || [[ "$_l" -gt 11 ]]; then
+    echo "k0llector: ERROR: invalid layer '${_l}' in -l LIST (valid: 1-11)" >&2
+    exit 2
+  fi
+done < <(tr ',' '\n' <<< "$LAYERS")
+
+# Validate SSH_JUMP format if set.
+if [[ -n "$SSH_JUMP" ]] && ! [[ "$SSH_JUMP" =~ ^[a-zA-Z0-9._@:/-]+$ ]]; then
+  echo "k0llector: ERROR: invalid SSH_JUMP format: '${SSH_JUMP}'" >&2
+  exit 2
+fi
 
 layer_enabled() {
   local n="$1"
@@ -141,6 +167,7 @@ redact_configmap_yaml_file() {
   [[ ! -f "$f" ]] && return 0
   local t
   t="$(mktemp "${TMPDIR:-/tmp}/k0llect-redact.XXXXXX")"
+  chmod 600 "$t"
   if [[ "${REDACT_KEEP_ORIGINAL}" == "1" ]]; then
     cp "$f" "${f}.full"
   fi
@@ -202,7 +229,7 @@ collect_namespace_pod_logs() {
   local ns="$1"
   local out_dir="$2"
   local n=0
-  mkdir -p "$out_dir"
+  mkdir -p "$out_dir" || { echo "k0llector: WARNING: cannot create $out_dir" >&2; return 1; }
   # shellcheck disable=SC2046
   for pod in $("${KUBECTL_CMD[@]}" get pods -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
     [[ -z "$pod" ]] && continue
@@ -212,10 +239,6 @@ collect_namespace_pod_logs() {
   done
 }
 
-RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="${OUTPUT_ROOT%/}/${RUN_TS}"
-mkdir -p "$OUT"
-
 need_kubectl
 
 if [[ -n "$REQUEST_TIMEOUT" ]]; then
@@ -223,6 +246,16 @@ if [[ -n "$REQUEST_TIMEOUT" ]]; then
 else
   KUBECTL_CMD=( "$KUBECTL" )
 fi
+
+# Preflight: verify kubectl can reach the cluster before creating any output.
+if ! "${KUBECTL_CMD[@]}" cluster-info >/dev/null 2>&1; then
+  echo "k0llector: ERROR: kubectl cannot reach the cluster. Check KUBECONFIG and cluster connectivity." >&2
+  exit 1
+fi
+
+RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT="${OUTPUT_ROOT%/}/${RUN_TS}"
+mkdir -p "$OUT" || { echo "k0llector: FATAL: cannot create output directory: $OUT" >&2; exit 1; }
 
 {
   echo "k0llector_version: ${K0LLECTOR_VERSION}"
@@ -250,13 +283,16 @@ collect "$OUT/00-cluster-info.txt" "${KUBECTL_CMD[@]}" cluster-info
 
 # --- Layer 1 ---
 if layer_enabled 1; then
+  echo "k0llector: collecting layer 1 (management cluster health)..."
   L1="$OUT/layer1-management-cluster"
   mkdir -p "$L1"
   collect "$L1/nodes-wide.txt" "${KUBECTL_CMD[@]}" get nodes -o wide
   collect "$L1/top-nodes.txt" "${KUBECTL_CMD[@]}" top nodes
   collect "$L1/pods-kube-system.txt" "${KUBECTL_CMD[@]}" get pods -n kube-system -o wide
   collect "$L1/api-resources-k0rdent.txt" "${KUBECTL_CMD[@]}" api-resources --api-group=k0rdent.mirantis.com -o wide
+  _saved_ifs="${IFS-}"
   IFS=',' read -r -a _coredns_sels <<< "$COREDNS_LABELS"
+  IFS="$_saved_ifs"
   for sel in "${_coredns_sels[@]}"; do
     sel="$(printf '%s\n' "$sel" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$sel" ]] && continue
@@ -268,6 +304,7 @@ fi
 
 # --- Layer 2 ---
 if layer_enabled 2; then
+  echo "k0llector: collecting layer 2 (KCM)..."
   L2="$OUT/layer2-kcm"
   mkdir -p "$L2"
   collect "$L2/management.yaml" "${KUBECTL_CMD[@]}" get management -o yaml
@@ -282,6 +319,7 @@ fi
 
 # --- Layer 3 ---
 if layer_enabled 3; then
+  echo "k0llector: collecting layer 3 (k0rdent CRs and templates)..."
   L3="$OUT/layer3-kcm-resources"
   mkdir -p "$L3"
   collect "$L3/clustertemplate.yaml" "${KUBECTL_CMD[@]}" get clustertemplate -n "$KCM_NS" -o yaml
@@ -308,6 +346,7 @@ fi
 
 # --- Layer 4 ---
 if layer_enabled 4; then
+  echo "k0llector: collecting layer 4 (Flux)..."
   L4="$OUT/layer4-flux"
   mkdir -p "$L4"
   collect "$L4/helmrelease-all.yaml" "${KUBECTL_CMD[@]}" get helmrelease -A -o yaml
@@ -327,14 +366,15 @@ fi
 
 # --- Layer 5 ---
 if layer_enabled 5; then
+  echo "k0llector: collecting layer 5 (HCP / k0smotron)..."
   L5="$OUT/layer5-hcp-k0smotron"
   mkdir -p "$L5"
   collect "$L5/pods-kcm-all.txt" "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" -o wide
   {
     echo "# k0llector @ $(timestamp_utc)"
-    echo "# non-Running lines (grep -v Running on kubectl get pods)"
+    echo "# non-Running / non-Succeeded lines (awk filter on kubectl get pods)"
     echo "---"
-    "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" 2>&1 | grep -v Running || true
+    "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" 2>&1 | awk 'NR==1 || ($3 !~ /Running/ && $3 !~ /Succeeded/ && $3 !~ /Completed/)' || true
     echo "---"
   } >"$L5/pods-not-running-lines.txt"
   collect "$L5/pods-part-of-k0smotron.txt" "${KUBECTL_CMD[@]}" get pods -n "$KCM_NS" -l app.kubernetes.io/part-of=k0smotron -o wide
@@ -345,6 +385,7 @@ fi
 
 # --- Layer 6 (optional SSH) ---
 if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
+  echo "k0llector: collecting layer 6 (SSH node journals)..."
   L6="$OUT/layer6-k0s-node"
   mkdir -p "$L6"
   collect "$L6/nodes-for-ssh.txt" "${KUBECTL_CMD[@]}" get nodes -o wide
@@ -368,13 +409,18 @@ if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
   # shellcheck disable=SC2046
   for node in $("${KUBECTL_CMD[@]}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
     [[ -z "$node" ]] && continue
-    cp_label="$("${KUBECTL_CMD[@]}" get node "$node" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/control-plane}' 2>/dev/null || true)"
-    role_label="$("${KUBECTL_CMD[@]}" get node "$node" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || true)"
+    # Fetch all three control-plane labels in a single kubectl call.
+    _node_label_str="$("${KUBECTL_CMD[@]}" get node "$node" \
+      -o jsonpath='{.metadata.labels.node\.kubernetes\.io/control-plane}{","}{.metadata.labels.node-role\.kubernetes\.io/control-plane}{","}{.metadata.labels.node-role\.kubernetes\.io/master}' \
+      2>/dev/null || echo ',,')"
+    _cp_label="${_node_label_str%%,*}"
+    _rest="${_node_label_str#*,}"
+    _role_label="${_rest%%,*}"
+    _m_label="${_rest#*,}"
     is_cp=""
-    [[ "$cp_label" == "true" ]] && is_cp=1
-    [[ "$role_label" == "true" ]] && is_cp=1
-    m_label="$("${KUBECTL_CMD[@]}" get node "$node" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}' 2>/dev/null || true)"
-    [[ "$m_label" == "true" ]] && is_cp=1
+    [[ "$_cp_label" == "true" ]] && is_cp=1
+    [[ "$_role_label" == "true" ]] && is_cp=1
+    [[ "$_m_label" == "true" ]] && is_cp=1
 
     target="$L6/${node}"
     mkdir -p "$target"
@@ -395,11 +441,25 @@ if layer_enabled 6 && [[ "$SKIP_SSH" != "1" ]] && [[ -n "$SSH_USER" ]]; then
     fi
   done
 elif layer_enabled 6; then
+  echo "k0llector: layer 6 (SSH node journals) skipped."
   L6="$OUT/layer6-k0s-node"
   mkdir -p "$L6"
+  _node_count="$({ "${KUBECTL_CMD[@]}" get nodes --no-headers 2>/dev/null || true; } | wc -l | tr -d ' ')"
   {
-    echo "# Skipped: set K0LLECT_SSH_USER=user and ensure SSH+sudo on nodes, or pass --no-ssh."
-    echo "# Optional bastion: K0LLECT_SSH_JUMP=user@bastion or --ssh-jump user@bastion"
+    echo "# Layer 6 SSH collection skipped."
+    if [[ "$SKIP_SSH" == "1" ]]; then
+      echo "# Reason: --no-ssh / K0LLECT_SKIP_SSH=1 was set."
+    else
+      echo "# Reason: K0LLECT_SSH_USER not set."
+    fi
+    echo "# Would have probed ${_node_count} node(s)."
+    echo "#"
+    echo "# Prerequisites to enable layer 6:"
+    echo "#   - SSH key authentication (passwordless) from this host to each node"
+    echo "#   - Passwordless sudo (sudo -n) configured on each node for the SSH user"
+    echo "#   - Set K0LLECT_SSH_USER=<user>"
+    echo "#   - Optional bastion: K0LLECT_SSH_JUMP=user@bastion or --ssh-jump user@bastion"
+    echo "#"
     echo "# To collect manually on each controller: sudo journalctl -u k0scontroller --no-pager -n 200"
     echo "# On each worker: sudo journalctl -u k0sworker --no-pager -n 200"
     echo "# Optional: sudo ${K0S_BIN} status; on controllers: sudo ${K0S_BIN} etcd member-list"
@@ -408,6 +468,7 @@ fi
 
 # --- Layer 7: Cluster API ---
 if layer_enabled 7; then
+  echo "k0llector: collecting layer 7 (Cluster API)..."
   L7="$OUT/layer7-cluster-api"
   mkdir -p "$L7"
   collect "$L7/clusters.yaml" "${KUBECTL_CMD[@]}" get cluster -A -o yaml
@@ -415,7 +476,18 @@ if layer_enabled 7; then
   collect "$L7/machinedeployments.yaml" "${KUBECTL_CMD[@]}" get machinedeployment -A -o yaml
   collect "$L7/machinesets.yaml" "${KUBECTL_CMD[@]}" get machineset -A -o yaml
   collect "$L7/kubeadmcontrolplanes.yaml" "${KUBECTL_CMD[@]}" get kubeadmcontrolplane -A -o yaml
-  for capi_ns in capi-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-docker-system capz-system capa-system capv-system capg-system capo-system; do
+  # Built-in CAPI provider namespaces. Add more with K0LLECT_CAPI_EXTRA_NS if your provider uses a different namespace.
+  _capi_ns=( capi-system capi-kubeadm-bootstrap-system capi-kubeadm-control-plane-system capi-docker-system capz-system capa-system capv-system capg-system capo-system )
+  if [[ -n "$CAPI_EXTRA_NS" ]]; then
+    _saved_ifs="${IFS-}"
+    IFS=',' read -r -a _capi_extra <<< "$CAPI_EXTRA_NS"
+    IFS="$_saved_ifs"
+    for _cn in "${_capi_extra[@]}"; do
+      _cn="$(trim_space "$_cn")"
+      [[ -n "$_cn" ]] && _capi_ns+=( "$_cn" )
+    done
+  fi
+  for capi_ns in "${_capi_ns[@]}"; do
     if namespace_exists "$capi_ns"; then
       collect "$L7/pods-${capi_ns}.txt" "${KUBECTL_CMD[@]}" get pods -n "$capi_ns" -o wide
       collect "$L7/events-${capi_ns}.txt" "${KUBECTL_CMD[@]}" get events -n "$capi_ns" --sort-by='.lastTimestamp'
@@ -425,6 +497,7 @@ fi
 
 # --- Layer 8: projectsveltos ---
 if layer_enabled 8; then
+  echo "k0llector: collecting layer 8 (projectsveltos)..."
   L8="$OUT/layer8-projectsveltos"
   mkdir -p "$L8"
   {
@@ -443,6 +516,7 @@ fi
 
 # --- Layer 9: observability (KOF / Prometheus Operator) ---
 if layer_enabled 9; then
+  echo "k0llector: collecting layer 9 (observability / KOF)..."
   L9="$OUT/layer9-observability"
   mkdir -p "$L9"
   collect "$L9/servicemonitors-kcm.yaml" "${KUBECTL_CMD[@]}" get servicemonitor -n "$KCM_NS" -o yaml
@@ -461,11 +535,14 @@ fi
 
 # --- Layer 10: namespace log samples (support-bundle style) ---
 if layer_enabled 10; then
+  echo "k0llector: collecting layer 10 (namespace log samples, parallel)..."
   L10="$OUT/layer10-namespace-logs"
   mkdir -p "$L10"
   _l10_ns=( "$KCM_NS" projectsveltos kube-system kubevirt cdi )
   if [[ -n "$K0S_EXTRA_NS" ]]; then
+    _saved_ifs="${IFS-}"
     IFS=',' read -r -a _l10_extra <<< "$K0S_EXTRA_NS"
+    IFS="$_saved_ifs"
     for _x in "${_l10_extra[@]}"; do
       _x="$(trim_space "$_x")"
       [[ -n "$_x" ]] && _l10_ns+=( "$_x" )
@@ -476,16 +553,24 @@ if layer_enabled 10; then
     echo "# Per-pod log tail=${LOG_TAIL}, max pods per namespace=${LOGS_MAX_PODS}"
     echo "# Namespaces (deduped, when present): ${_l10_readme_ns}"
   } >"$L10/README.txt"
+  _l10_pids=()
   while IFS= read -r log_ns; do
     [[ -z "$log_ns" ]] && continue
     if namespace_exists "$log_ns"; then
-      collect_namespace_pod_logs "$log_ns" "$L10/logs-${log_ns}"
+      collect_namespace_pod_logs "$log_ns" "$L10/logs-${log_ns}" &
+      _l10_pids+=($!)
     fi
   done < <(printf '%s\n' "${_l10_ns[@]}" | awk 'NF && !seen[$0]++')
+  if [[ ${#_l10_pids[@]} -gt 0 ]]; then
+    for _pid in "${_l10_pids[@]}"; do
+      wait "$_pid" || true
+    done
+  fi
 fi
 
 # --- Layer 11: k0s-oriented snapshots (in-cluster; pair with layer 6 for host journals) ---
 if layer_enabled 11; then
+  echo "k0llector: collecting layer 11 (k0s snapshots)..."
   L11="$OUT/layer11-k0s"
   mkdir -p "$L11"
   {
@@ -532,7 +617,9 @@ if layer_enabled 11; then
     echo "---"
   } >"$L11/pods-kube-system-not-ready-lines.txt"
   if [[ -n "$K0S_EXTRA_NS" ]]; then
+    _saved_ifs="${IFS-}"
     IFS=',' read -r -a _k11_extra <<< "$K0S_EXTRA_NS"
+    IFS="$_saved_ifs"
     for _xn in "${_k11_extra[@]}"; do
       _xn="$(trim_space "$_xn")"
       [[ -z "$_xn" ]] && continue
@@ -568,6 +655,11 @@ _summary_ctx="$("${KUBECTL_CMD[@]}" config current-context 2>/dev/null || echo '
   echo "bundle_disk_usage:"
   du -sh "$OUT" 2>/dev/null || true
   echo "---"
+  if layer_enabled 11 && [[ "${REDACT_CONFIGMAPS}" != "1" ]]; then
+    echo "WARNING: Layer 11 ConfigMaps collected WITHOUT redaction. Review bundle before sharing."
+    echo "         Use --redact-configmaps or K0LLECT_REDACT_CONFIGMAPS=1 to mask obvious secrets."
+    echo "---"
+  fi
   echo "Files with non-zero # exit_code (from collect/kubectl steps):"
   _nz=0
   _total_f=0
@@ -606,7 +698,10 @@ echo "k0llector: wrote bundle under: $OUT"
 echo "k0llector: summary: $OUT/00-SUMMARY.txt"
 
 if [[ "$CREATE_ARCHIVE" == "1" ]]; then
-  ARCHIVE_FILE="${ARCHIVE_PATH_OVERRIDE:-${OUTPUT_ROOT%/}/${RUN_TS}.tar.gz}"
+  _archive_ctx="$(printf '%s' "$_summary_ctx" | tr -dc 'a-zA-Z0-9._-')"
+  _archive_ctx="${_archive_ctx:0:60}"
+  [[ -z "$_archive_ctx" ]] && _archive_ctx="cluster"
+  ARCHIVE_FILE="${ARCHIVE_PATH_OVERRIDE:-${OUTPUT_ROOT%/}/${_archive_ctx}-${RUN_TS}.tar.gz}"
   if ! command -v tar >/dev/null 2>&1; then
     echo "k0llector: --archive requested but tar not found; skipping archive." >&2
   else
@@ -616,4 +711,10 @@ if [[ "$CREATE_ARCHIVE" == "1" ]]; then
   fi
 else
   echo "k0llector: archive with: tar -czf \"${RUN_TS}.tar.gz\" -C \"${OUTPUT_ROOT%/}\" \"$RUN_TS\"  (or run with -a / --archive)"
+fi
+
+# Exit non-zero if any collection steps failed.
+if [[ "${_nz:-0}" -gt 0 ]]; then
+  echo "k0llector: WARNING: ${_nz} collection step(s) had non-zero exit codes; see $OUT/00-SUMMARY.txt" >&2
+  exit 1
 fi
